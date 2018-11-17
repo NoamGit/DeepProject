@@ -2,15 +2,30 @@ import os
 from zipfile import ZipFile
 import pandas as pd # pandas
 import re
-import ujson as json
 import pickle
+import ujson as json
 import gzip
 import cProfile
+import nltk
+import unicodedata
+from nltk.corpus import stopwords
+from utils.document import *
+import time
 
 class WikilinksOldIterator:
+    """
+    This iterator is meant to be used with the older format of the dataset where each
+    file has a single json with many wikilinks in it. It is arguably faster then the
+    new iterator but requires quite a lot of memory
+
+    note that WikilinksNewIterator and WikilinksOldIterator can be dropped-in-replacements of each other
+    """
 
     # path should either point to a zip file or a directory containing all dataset files,
     def __init__(self, path="wikilink.zip", limit_files = 0):
+        """
+        :param path:    Path to either a zip file or a directory containing the dataset
+        """
         self._path = path
         self.limit_files =  limit_files
         self.wikilink_fname = 'wikilink.zip'
@@ -18,7 +33,7 @@ class WikilinksOldIterator:
     def get_wlinks(self):
         # outputs the next wlink piece
         # print "get next()"
-        for wlink in self.wikilinks():
+        for wlink in self._wikilinks_iter.wikilinks():
             yield wlink
 
     def _wikilink_files(self):
@@ -41,14 +56,20 @@ class WikilinksOldIterator:
                 print "opening ", fname
                 yield zf.open(fname)
 
-    # the main function - returns a generator that can iterate over all dataset
+    def addMetionToContext(self, wlink):
+        mention = wlink['word']
     def wikilinks(self):
+        """
+        This is the main function - it is a generator that can be used as an iterator
+        returning a single wikilink object at a time
+        """
         c = 0
         for f in self._wikilink_files():
             df = pd.read_json(f)
             for wlink in df.wlinks:
                 if(not 'wikiId' in wlink):
                     continue
+
                 yield wlink
             df = None
             c += 1
@@ -57,148 +78,101 @@ class WikilinksOldIterator:
                 print "stoppped at file ", self.limit_files
                 break
 
-
-def save_zip(object, filename, bin = 1):
-    """Saves a compressed object to disk
-    """
-    file = gzip.GzipFile(filename, 'wb')
-    file.write(pickle.dumps(object, bin))
-    file.close()
-
-
-def load_zip(filename):
-    """Loads a compressed object from disk
-    """
-    file = gzip.GzipFile(filename, 'rb')
-    buffer = ""
-    while 1:
-        data = file.read()
-        if data == "":
-            break
-        buffer += data
-    object = pickle.loads(buffer)
-    file.close()
-    return object
-
-
-class WikilinksStatistics:
-    def __init__(self, wikilinks_iter):
-        self._wikilinks_iter = wikilinks_iter
-        self.mentionCounts = dict()
-        self.senseDic = dict()
-        self.mentionLinks = dict()
-        self.conceptCounts = dict()
-        self.contextDictionary = dict()
-
-    def senseDicCreation(self):
-        # creates the {'word',S = [sensens]} dictionary
-        if(os.path.isfile(self._wikilinks_iter._path+'\sense_dict.txt.gz')):
-            print("loading sense dictionary form \Data")
-            self.senseDic = load_zip(self._wikilinks_iter._path+'\sense_dict.txt.gz')
-            # output = open(self._wikilinks_iter._path+'\sense_dict.txt', 'rb')
-            # self.senseDic = pickle.load(output)    # 'obj_dict' is a dict object
-            # output.close()
-        else: # if not, run over all data and create dic
-            print "creating sense dictionary \Data"
-            for wlink in self._wikilinks_iter.wikilinks():
-                if not wlink['word'] in self.senseDic:
-                    self.senseDic[wlink['word']] = set([wlink['wikiId']])
-                else:
-                    self.senseDic[wlink['word']].add(wlink['wikiId'])
-            print "done!"
-            save_zip(self.senseDic, self._wikilinks_iter._path+'\sense_dict.txt.gz')
-            # output = open(self._wikilinks_iter._path+'\sense_dict.txt','ab+')
-            # pickle.dump(self.senseDic, output)
-            # output.close()
-
-            # need to save the dic for further use
-
-    # goes over all dataset and calculates a number statistics
-    def calcStatistics(self):
-        print "getting statistics"
-        for wlink in self._wikilinks_iter.wikilinks():
-            if not wlink['word'] in self.mentionLinks:
-                self.mentionLinks[wlink['word']] = dict()
-            self.mentionLinks[wlink['word']][wlink['wikiId']] = self.mentionLinks[wlink['word']].get(wlink['wikiId'], 0) + 1
-            self.mentionCounts[wlink['word']] = self.mentionCounts.get(wlink['word'], 0) + 1
-            self.conceptCounts[wlink['wikiId']] = self.conceptCounts.get(wlink['wikiId'], 0) + 1
-
-            if 'right_context' in wlink:
-                for w in self._wikilinks_iter.contextAsList(wlink['right_context']):
-                    self.contextDictionary[w] = self.contextDictionary.get(w, 0) + 1
-            if 'left_context' in wlink:
-                for w in self._wikilinks_iter.contextAsList(wlink['left_context']):
-                    self.contextDictionary[w] = self.contextDictionary.get(w, 0) + 1
-
-    def _sortedList(self, l):
-        l = [(k,v) for k,v in l.items()]
-        l.sort(key=lambda (k,v):-v)
-        l.append(("--",0))
-        return l
-
-    def printSomeStats(self):
-        print "distinct terms: ", len(self.mentionCounts)
-        print "distinct concepts: ", len(self.conceptCounts)
-        print "distinct context words: ", len(self.contextDictionary)
-
-        k, v = stats.mentionLinks.items()[0]
-        wordsSorted = [(k, self._sortedList(v), sum(v.values())) for k,v in stats.mentionLinks.items()]
-        wordsSorted.sort(key=lambda (k, v, d): v[1][1])
-
-        print("some ambiguous terms:")
-        for w in wordsSorted[-10:]:
-            print w
-
 class WikilinksNewIterator:
 
     # the new iterator does not support using a zip file.
-    def __init__(self, path, limit_files = 0):
+    def __init__(self, path, limit_files = 0, mention_filter=None, resolveIds=False, db=None):
         self._path = path
         self._limit_files = limit_files
+        self._mention_filter = mention_filter
+        self._stopwords = stopwords.words('english')
+        self._resolveIds = resolveIds
+        self._db = db
+
+    def get_wlink(self):
+        # outputs the next wlink piece
+        # print "get next()"
+        for wlink in self.wikilinks():
+            yield wlink
 
     def _wikilink_files(self):
-        for file in os.listdir(self._path):
-            if os.path.isdir(os.path.join(self._path, file)):
+        for i, f in enumerate(os.listdir(self._path)):
+            if os.path.isdir(os.path.join(self._path, f)):
                 continue
-            print "opening ", file
-            yield open(os.path.join(self._path, file), 'r')
+            print time.strftime("%H:%M:%S"), "- opening", f, "(", i, "opened so far in this epoch)"
+            yield open(os.path.join(self._path, f), 'r')
 
-    def wikilinks(self):
-        c = 0
-        for f in self._wikilink_files():
+    def jsons(self):
+        r = 0
+        t = 0
+        for c, f in enumerate(self._wikilink_files()):
             lines = f.readlines()
             for line in lines:
                 if len(line) > 0:
                     wlink = json.loads(line)
 
-                    # preprocess
-                    if 'right_context' in wlink:
-                        wlink['right_context'] = wlink['right_context'].encode('utf-8')
-                    if 'left_context' in wlink:
-                        wlink['left_context'] = wlink['left_context'].encode('utf-8')
-
                     # filter
-                    if (not 'word' in wlink) or (not 'wikiId' in wlink):
+                    if not 'word' in wlink:
                         continue
-                    if not ('right_context' in wlink or 'left_context' in wlink):
+                    if 'right_context' not in wlink and 'left_context' not in wlink:
                         continue
+                    if self._mention_filter is not None and wlink['word'] not in self._mention_filter:
+                        continue
+
+                    if not self._resolveIds:
+                        wlink['wikiId'] = int(wlink['wikiId']) if 'wikiId' in wlink else None
+                    else:
+                        t += 1
+                        url = wlink['wikiurl']
+                        if url.rfind('/') > -1:
+                            url = url[url.rfind('/')+1:]
+                        if url.find('#') > -1:
+                            url = url[:url.find('#')]
+                        wikiId = self._db.resolvePage(url)
+                        if wikiId is None:
+                            continue
+                        else:
+                            wlink['wikiId'] = wikiId
+                            r += 1
+                        if t % 100000 == 0:
+                            print "% able to resolve:", 100 * float(r) / t, "% out of", t
+
+                    if 'mention_as_list' not in wlink:
+                        mention_as_list = unicodedata.normalize('NFKD', wlink['word']).encode('ascii','ignore').lower()
+                        mention_as_list = nltk.word_tokenize(mention_as_list)
+                        wlink['mention_as_list'] = mention_as_list
+
+                    # preprocess context (if not already processed
+                    if 'right_context' in wlink and not isinstance(wlink['right_context'], list):
+                        wlink['right_context_text'] = wlink['right_context']
+                        r_context = unicodedata.normalize('NFKD', wlink['right_context']).encode('ascii','ignore').lower()
+                        wlink['right_context'] = nltk.word_tokenize(r_context)
+                        wlink['right_context'] = [w for w in wlink['right_context']]
+                    if 'left_context' in wlink and not isinstance(wlink['left_context'], list):
+                        wlink['left_context_text'] = wlink['left_context']
+                        l_context = unicodedata.normalize('NFKD', wlink['left_context']).encode('ascii','ignore').lower()
+                        wlink['left_context'] = nltk.word_tokenize(l_context)
+                        wlink['left_context'] = [w for w in wlink['left_context']]
 
                     # return
                     yield wlink
 
             f.close()
-            c += 1
-            if self._limit_files > 0 and c == self._limit_files:
+            if self._limit_files > 0 and c >= self._limit_files:
                 break
 
-    # transforms a context into a list of words
-    def contextAsList(self, context):
-        # Might need more processing?
-        return str.split(re.sub(r'\W+', '', context))
+    def mentions(self):
+        for doc in self.documents():
+            for mention in doc.mentions:
+                yield mention
 
-if __name__ == "__main__":
-    iter = WikilinksNewIterator("C:\\repo\\WikiLink\\randomized\\train", limit_files=1)
-    stats = WikilinksStatistics(iter)
-    stats.calcStatistics()
-    stats.printSomeStats()
+    def documents(self):
+        for i, json in enumerate(self.jsons()):
+            doc = Document(str(i), i)
+            m = MentionFromDict(json, doc)
+            doc.mentions.append(m)
+            doc.tokens = [x for x in m.left_context_iter()] + \
+                         [x for x in m.mention_text_tokenized()] + \
+                         [x for x in m.right_context_iter()]
+            yield doc
 
